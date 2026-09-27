@@ -1,0 +1,99 @@
+services:
+  redpanda:
+    image: redpandadata/redpanda:v24.2.7
+    container_name: redpanda
+    command:
+      - redpanda
+      - start
+      - --mode=dev-container
+      - --smp=1
+      - --memory=1G
+      - --node-id=0
+      - --kafka-addr=internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr=internal://redpanda:9092,external://localhost:19092
+    ports:
+      - "19092:19092"
+    healthcheck:
+      # depends_on only waits for the container to start, not for Redpanda
+      # itself to be ready to accept Kafka connections; without this,
+      # generator/consumer would race Redpanda's startup and crash.
+      test: ["CMD-SHELL", "rpk cluster health | grep -q 'Healthy:.*true'"]
+      interval: 5s
+      timeout: 5s
+      retries: 15
+      start_period: 10s
+
+  redpanda-console:
+    image: redpandadata/console:v2.7.2
+    container_name: redpanda-console
+    depends_on:
+      - redpanda
+    environment:
+      KAFKA_BROKERS: redpanda:9092
+    ports:
+      - "8080:8080"
+
+  redis:
+    image: redis:7-alpine
+    container_name: fraud-redis
+    ports:
+      - "6379:6379"
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.api
+    container_name: fraud-api
+    depends_on:
+      redis:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    environment:
+      REDIS_HOST: redis
+    volumes:
+      - ./logs:/app/logs
+    healthcheck:
+      # python:3.12-slim has no curl; urllib is stdlib, needs no extra install
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=3)"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+
+  generator:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.stream
+    container_name: fraud-generator
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    command:
+      - src.data_generator
+      - --mode=kafka
+      - --bootstrap=redpanda:9092
+      - --rate=5
+      - --fraud-rate=0.05
+
+  consumer:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.stream
+    container_name: fraud-consumer
+    depends_on:
+      redpanda:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+    command:
+      - src.consumer
+      - --bootstrap=redpanda:9092
+      - --api-url=http://api:8000

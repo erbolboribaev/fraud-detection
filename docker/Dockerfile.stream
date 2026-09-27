@@ -1,0 +1,13 @@
+# Streaming image: the transaction generator and the Kafka->API consumer.
+# Both are lightweight (no ML libraries needed here); which one runs is
+# decided by the command each service passes in docker-compose.yml.
+FROM python:3.12-slim
+
+WORKDIR /app
+
+COPY requirements-stream.txt .
+RUN pip install --no-cache-dir -r requirements-stream.txt
+
+COPY src/ ./src/
+
+ENTRYPOINT ["python", "-m"]

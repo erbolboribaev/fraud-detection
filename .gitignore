@@ -1,0 +1,14 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Data and runtime artifacts (regenerable; keep the repo small)
+data/raw/
+data/processed/
+logs/
+reports/
+
+# OS
+.DS_Store

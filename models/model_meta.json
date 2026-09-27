@@ -1,0 +1,26 @@
+{
+  "features": [
+    "log_amount",
+    "hour",
+    "amount_ratio",
+    "prev_txn_count",
+    "txn_count_10m",
+    "secs_since_last",
+    "is_new_location",
+    "category_code"
+  ],
+  "threshold": 0.9319896329581029,
+  "category_map": {
+    "grocery": 0,
+    "restaurant": 1,
+    "transport": 2,
+    "fuel": 3,
+    "clothing": 4,
+    "pharmacy": 5,
+    "electronics": 6,
+    "travel": 7,
+    "gift_card": 8,
+    "crypto": 9
+  },
+  "no_history_gap": 604800.0
+}
