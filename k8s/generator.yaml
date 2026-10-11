@@ -1,0 +1,30 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: generator
+  namespace: fraud-detection
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: generator
+  template:
+    metadata:
+      labels:
+        app: generator
+    spec:
+      enableServiceLinks: false
+      initContainers:
+        - name: wait-for-redpanda
+          image: busybox:1.36
+          command: ["sh", "-c", "until nc -z redpanda 9092; do echo waiting for redpanda; sleep 2; done"]
+      containers:
+        - name: generator
+          image: fraud-detection-generator:latest
+          imagePullPolicy: Never
+          args:
+            - src.data_generator
+            - --mode=kafka
+            - --bootstrap=redpanda:9092
+            - --rate=5
+            - --fraud-rate=0.05

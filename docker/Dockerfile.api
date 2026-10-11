@@ -5,10 +5,16 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
+# LightGBM's compiled extension needs libgomp (OpenMP) at runtime, which the
+# slim base image doesn't include -- without it, `import lightgbm` fails
+# with "OSError: libgomp.so.1: cannot open shared object file".
+RUN apt-get update && apt-get install -y --no-install-recommends libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY requirements-api.txt .
 RUN pip install --no-cache-dir -r requirements-api.txt
 
-COPY src/schema.py src/predictor.py src/__init__.py ./src/
+COPY src/schema.py src/predictor.py src/alerts.py src/__init__.py ./src/
 COPY api/ ./api/
 COPY models/ ./models/
 

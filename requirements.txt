@@ -15,3 +15,5 @@ evidently==0.4.40
 pytest==8.3.4
 httpx==0.28.1
 fakeredis
+shap==0.52.0
+matplotlib

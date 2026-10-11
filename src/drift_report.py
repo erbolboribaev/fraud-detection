@@ -22,6 +22,7 @@ from src.schema import FEATURES
 REFERENCE_PATH = "data/processed/features.parquet"
 CURRENT_PATH = "logs/predictions.jsonl"
 REPORT_PATH = "reports/drift_report.html"
+SUMMARY_JSON_PATH = "reports/drift_summary.json"
 MIN_CURRENT_ROWS = 30  # below this, drift stats are too noisy to trust
 
 
@@ -84,6 +85,21 @@ def main():
         print(f"  {col:<18} {flag:<8} score={info['drift_score']:.4f} ({info['stattest_name']})")
 
     print(f"\nFull report saved to {REPORT_PATH} -- open it in a browser.")
+
+    # Compact summary for the dashboard's GET /drift/summary -- read instead
+    # of recomputing the full Evidently report on every request.
+    Path(SUMMARY_JSON_PATH).write_text(json.dumps({
+        "generated_at": Path(CURRENT_PATH).stat().st_mtime,
+        "dataset_drift": bool(summary["dataset_drift"]),
+        "drifted_count": int(summary["number_of_drifted_columns"]),
+        "total_count": int(summary["number_of_columns"]),
+        "features": [
+            {"name": col, "drifted": bool(detail[col]["drift_detected"]),
+             "score": float(detail[col]["drift_score"])}
+            for col in FEATURES
+        ],
+    }, indent=2))
+    print(f"Compact summary saved to {SUMMARY_JSON_PATH}")
 
 
 if __name__ == "__main__":

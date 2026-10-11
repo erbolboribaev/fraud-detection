@@ -1,0 +1,43 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redpanda-console
+  namespace: fraud-detection
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redpanda-console
+  template:
+    metadata:
+      labels:
+        app: redpanda-console
+    spec:
+      enableServiceLinks: false
+      initContainers:
+        - name: wait-for-redpanda
+          image: busybox:1.36
+          command: ["sh", "-c", "until nc -z redpanda 9092; do echo waiting for redpanda; sleep 2; done"]
+      containers:
+        - name: redpanda-console
+          image: redpandadata/console:v2.7.2
+          env:
+            - name: KAFKA_BROKERS
+              value: "redpanda:9092"
+          ports:
+            - containerPort: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redpanda-console
+  namespace: fraud-detection
+spec:
+  # Docker Desktop's Kubernetes binds LoadBalancer services straight to
+  # localhost -- no port-forwarding needed, same as the Compose setup.
+  type: LoadBalancer
+  selector:
+    app: redpanda-console
+  ports:
+    - port: 8080
+      targetPort: 8080

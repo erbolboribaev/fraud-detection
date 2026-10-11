@@ -29,6 +29,10 @@ DATA_PATH = "data/processed/features.parquet"
 MODEL_DIR = Path("models")
 ONNX_PATH = MODEL_DIR / "fraud_model.onnx"
 META_PATH = MODEL_DIR / "model_meta.json"
+# Native LightGBM format, kept alongside the ONNX export. Serving (predictor.py)
+# only ever loads the ONNX file; this one exists purely so src/explain.py can
+# run exact tree-based SHAP explanations, which onnxruntime can't do.
+BOOSTER_PATH = MODEL_DIR / "fraud_model.txt"
 
 
 def time_split(df: pl.DataFrame, train_frac=0.70, val_frac=0.15):
@@ -111,8 +115,11 @@ def main():
     for name, g in sorted(zip(FEATURES, gain), key=lambda t: -t[1]):
         print(f"  {name:<18} {100 * g / gain.sum():5.1f}%")
 
-    # ---- ONNX export -------------------------------------------------------
+    # ---- Native LightGBM export (for SHAP; see BOOSTER_PATH note above) ---
     MODEL_DIR.mkdir(exist_ok=True)
+    model.booster_.save_model(str(BOOSTER_PATH))
+
+    # ---- ONNX export -------------------------------------------------------
     onnx_model = onnxmltools.convert_lightgbm(
         model,
         initial_types=[("input", FloatTensorType([None, len(FEATURES)]))],
@@ -127,7 +134,7 @@ def main():
         "category_map": CATEGORY_MAP,
         "no_history_gap": NO_HISTORY_GAP,
     }, indent=2))
-    print(f"\nSaved {ONNX_PATH} and {META_PATH}")
+    print(f"\nSaved {ONNX_PATH}, {META_PATH}, and {BOOSTER_PATH}")
 
     # ---- Verify ONNX matches LightGBM and measure latency ------------------
     sess = ort.InferenceSession(str(ONNX_PATH), providers=["CPUExecutionProvider"])
