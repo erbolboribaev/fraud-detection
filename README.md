@@ -34,11 +34,42 @@ flowchart LR
     API --> ONNX["ONNX model<br/>(LightGBM, ~10-30 µs)"]
     API --> LOG[("predictions.jsonl")]
     API -.->|"if fraud"| ALERT["Alerts"]
+    API -.->|"scored-transactions"| RP2["Redpanda<br/>(scored topic)"]
+    RP2 --> BRZ["Spark: bronze<br/>(raw, Delta)"]
+    BRZ --> SLV["Spark: silver<br/>(validated, deduplicated)"]
+    BRZ -.->|"bad records"| QUA[("quarantine")]
+    SLV --> GLD["Spark SQL: gold<br/>(fraud rate, pipeline health)"]
+    S3[("MinIO / AWS S3")] -.- BRZ
     LOG --> DASH["React dashboard<br/>(polls every 2s)"]
     LOG --> DRIFT["Evidently<br/>(drift report)"]
 ```
 
 The box most people get wrong: **the generator/Redpanda/consumer path exists only for this demo.** A real payment processor would call `POST /predict` directly -- nothing downstream of that line would need to change.
+
+## Lakehouse layer (Spark + Delta on S3)
+
+Besides serving, every scored transaction is published to a second Kafka topic (`scored-transactions`) and lands in a small lakehouse built with Spark Structured Streaming and Delta Lake. This replaces `predictions.jsonl` as the *analytical* store; the dashboard still reads the flat file, so the hot path is unchanged.
+
+| Layer | Job | What it holds |
+| ----- | --- | ------------- |
+| **Bronze** | `lakehouse/jobs/bronze.py` (streaming) | Kafka records exactly as received (raw JSON + topic/partition/offset), partitioned by ingest date. Never fails on a bad payload. |
+| **Silver** | `lakehouse/jobs/silver.py` (streaming) | Parsed, typed, validated, deduplicated by `transaction_id` via Delta `MERGE`. Invalid records go to a **quarantine** table with a `reject_reason`. |
+| **Gold** | `lakehouse/jobs/gold.py` (batch, Spark SQL) | `fraud_hourly` (flagged rate by hour, category, country) and `pipeline_health_hourly` (accepted vs rejected records). |
+
+Design points:
+
+- **Idempotent by construction.** Kafka and the API's publisher are at-least-once, so silver uses `MERGE ... WHEN NOT MATCHED THEN INSERT`: a transaction is stored once however many times it arrives. Same idea as the Redis `SETNX` guard on the serving side.
+- **Publishing can never hurt scoring.** It is opt-in (`KAFKA_BOOTSTRAP`), asynchronous, and wrapped in a short circuit breaker; dropped events are counted and shown in `/health`. The cost is at-most-once delivery *from the API*, which is acceptable for analytics and would not be for the scoring path.
+- **One contract.** `src/events.py` defines the event once; the Spark schema is derived from it, and a test pushes an API-built event through the lake's parser.
+- **Bad data is kept, not dropped.** Bronze stores raw bytes; silver quarantines with a reason, so a producer changing its payload shows up as a rising `reject_rate` instead of missing rows.
+- **S3-ready.** Jobs only see an `s3a://` path. Locally that is MinIO; for AWS S3, change `LAKE_ROOT`, drop `S3_ENDPOINT`, and use an IAM role. *This repo has only been run against MinIO, not AWS.*
+
+Run it (after `docker compose up --build -d`):
+
+```bash
+docker compose run --rm lakehouse-gold     # build the gold tables from silver
+# browse the lake files in the MinIO console: http://localhost:9001 (minioadmin / minioadmin)
+```
 
 ## Results
 
@@ -52,7 +83,7 @@ The box most people get wrong: **the generator/Redpanda/consumer path exists onl
 | Model inference latency (ONNX, single transaction) | ~10-30 µs                                 |
 | Model inference latency (raw LightGBM, for comparison) | ~400-800 µs (~30x slower)             |
 | Top features by SHAP impact                      | `amount_ratio` (47%), `category_code` (21%) |
-| Tests                                            | 11 passing (pytest + CI)                    |
+| Tests                                            | pytest + CI: core, event contract, Spark transforms |
 
 Latency above is model inference only; the full `/predict` request additionally includes HTTP handling and Redis reads/writes.
 
@@ -66,6 +97,8 @@ Latency above is model inference only; the full `/predict` request additionally 
 | Serving             | FastAPI + Redis (per-card state)                  |
 | Explainability      | SHAP (TreeExplainer on the native LightGBM model) |
 | Drift monitoring    | Evidently AI                                      |
+| Lakehouse           | Spark Structured Streaming, Delta Lake, Spark SQL |
+| Object storage      | MinIO locally (S3-compatible); AWS S3-ready       |
 | Frontend            | React + Vite                                      |
 | Deployment          | Docker Compose, Kubernetes (manifests included)   |
 | CI/CD               | GitHub Actions (tests + Docker image builds)      |
@@ -92,19 +125,22 @@ fraud-detection/
 │   ├── predictor.py            # online feature computation + ONNX inference
 │   ├── train.py                # LightGBM training, ONNX + native export
 │   ├── consumer.py             # Kafka -> API bridge
+│   ├── events.py               # scored-transaction event contract (shared with the lake)
+│   ├── publisher.py            # best-effort Kafka publisher used by the API
 │   ├── alerts.py               # fraud alert delivery (file/console/Slack)
 │   ├── drift_report.py         # Evidently drift report
 │   ├── explain.py              # standalone SHAP CLI
 │   └── apply_feedback.py       # joins feedback into a retraining dataset
+├── lakehouse/                  # Spark jobs: bronze.py, silver.py, gold.py + pure transforms
 ├── api/main.py                 # FastAPI app: /predict, /feedback, dashboard reads
 ├── frontend/                   # React + Vite dashboard
 ├── models/                     # trained model artifacts (ONNX + native LightGBM)
-├── docker/                     # Dockerfile.api (lean), Dockerfile.stream
+├── docker/                     # Dockerfile.api (lean), Dockerfile.stream, Dockerfile.lakehouse
 ├── k8s/                        # Kubernetes manifests
 ├── tests/                      # pytest suite
 ├── docs/                       # screenshots
 ├── docker-compose.yml
-├── requirements.txt            # requirements-api.txt / requirements-stream.txt per image
+├── requirements.txt            # requirements-api / -stream / -lakehouse .txt per image
 └── .github/workflows/ci.yml
 ```
 
@@ -136,7 +172,9 @@ These were found by running the system end to end and noticing the output didn't
 
 ## Limitations / what would break at 100x scale
 
-- **`logs/predictions.jsonl` is a flat file, re-read on every dashboard request.** Fine at demo volume; at real production throughput this needs a proper time-series store (or at minimum a capped ring buffer) instead of scanning a growing file.
+- **`logs/predictions.jsonl` is still a flat file, re-read on every dashboard request.** The lakehouse now holds the analytical copy, but the dashboard has not been moved onto it; at real throughput it would read a serving store (or gold tables) instead of scanning a growing file.
+- **The lakehouse has only been run on a laptop-sized stack.** MinIO instead of AWS S3, one Kafka partition, one Spark executor, and gold is a full rebuild rather than incremental. There is no table compaction/`OPTIMIZE`, schema-evolution policy or retention yet.
+- **Feed from the API is at-most-once.** If Kafka is down, events are dropped (and counted). The silver layer prevents duplicates but cannot recover events the API never sent; a transactional outbox or publishing from the consumer would close that gap.
 - **Single Redis instance is a single point of failure.** Production would need Redis Cluster or a managed equivalent with replication.
 - **The model is trained entirely on synthetic data.** The fraud patterns are rule-generated, so the reported metrics describe how well the model learned those rules -- not how it would perform on real transaction data.
 - **No authentication on the API.** `/predict` and `/feedback` are open; a real deployment needs request signing or mTLS between the payment processor and this service.
@@ -147,7 +185,13 @@ These were found by running the system end to end and noticing the output didn't
 pytest tests/ -v
 ```
 
-11 tests covering feature-engineering correctness, training/serving parity, idempotency under simulated Kafka redelivery, and the timezone fix (run under a non-UTC `TZ` to prove it).
+Core tests cover feature-engineering correctness, training/serving parity, idempotency under simulated Kafka redelivery, the timezone fix (run under a non-UTC `TZ`), and the event contract/publisher.
+
+Spark transformations (parsing, validation/quarantine, dedup, gold SQL) have their own tests and CI job; they need Java and `pip install -r requirements-lakehouse.txt`:
+
+```bash
+python -m pytest tests/lakehouse -v
+```
 
 ## License
 

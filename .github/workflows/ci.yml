@@ -26,3 +26,31 @@ jobs:
         run: |
           docker build -f docker/Dockerfile.api -t fraud-api-ci .
           docker build -f docker/Dockerfile.stream -t fraud-stream-ci .
+
+  # Spark transformations (parsing, validation, dedup, gold SQL) run on a
+  # local Spark session. Kept separate so the main job stays fast and doesn't
+  # need Java or PySpark.
+  lakehouse:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements-lakehouse.txt pytest
+
+      - name: Run lakehouse tests
+        run: python -m pytest tests/lakehouse -v
+
+      # Also downloads the Delta/Kafka/S3A jars, so a wrong package
+      # coordinate in lakehouse/config.py fails here instead of at `docker compose up`.
+      - name: Verify lakehouse image builds
+        run: docker build -f docker/Dockerfile.lakehouse -t fraud-lakehouse-ci .

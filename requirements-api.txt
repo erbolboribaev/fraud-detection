@@ -3,6 +3,7 @@ uvicorn[standard]==0.34.0
 pydantic==2.10.4
 onnxruntime==1.20.1
 redis==5.2.1
+kafka-python-ng==2.2.3
 numpy==2.2.1
 lightgbm==4.5.0
 shap==0.52.0

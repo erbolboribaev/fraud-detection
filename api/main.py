@@ -23,11 +23,15 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from src.alerts import send_alert
+from src.events import build_scored_event
 from src.predictor import FraudPredictor
+from src.publisher import ScoredEventPublisher
 from src.schema import FEATURES
 
 predictor: FraudPredictor | None = None
 explainer: "shap.TreeExplainer | None" = None
+# Feed for the Spark lakehouse (lakehouse/). Disabled unless KAFKA_BOOTSTRAP is set.
+publisher: ScoredEventPublisher | None = None
 
 LOG_PATH = Path("logs/predictions.jsonl")
 ALERTS_PATH = Path("logs/alerts.jsonl")
@@ -79,15 +83,18 @@ def read_jsonl_tail(path: Path, limit: int) -> list[dict]:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global predictor, explainer
+    global predictor, explainer, publisher
     # Loaded once at startup: the ONNX session, Redis connection pool, and
     # SHAP explainer are reused across requests instead of being recreated
     # every call.
     predictor = FraudPredictor()
     explainer = shap.TreeExplainer(lgb.Booster(model_file=BOOSTER_PATH))
+    publisher = ScoredEventPublisher.from_env()
     yield
+    publisher.close()
     predictor = None
     explainer = None
+    publisher = None
 
 
 app = FastAPI(title="Fraud Detection API", lifespan=lifespan)
@@ -129,7 +136,7 @@ class PredictResponse(BaseModel):
 def health():
     try:
         predictor.redis.ping()
-        return {"status": "ok"}
+        return {"status": "ok", "scored_events": publisher.stats}
     except Exception as e:
         raise HTTPException(status_code=503, detail=f"redis unavailable: {e}")
 
@@ -150,6 +157,25 @@ def to_utc_epoch(dt: datetime | None) -> float:
     return dt.timestamp()
 
 
+def publish_scored_event(txn: "Transaction", ts: float, result: dict) -> None:
+    """Hand the scored transaction to the lakehouse feed. Best-effort and
+    non-blocking: a Kafka problem must never fail or slow a prediction."""
+    if publisher is None or not publisher.enabled:
+        return
+    publisher.publish(build_scored_event(
+        transaction_id=txn.transaction_id,
+        card_id=txn.card_id,
+        amount=txn.amount,
+        merchant_category=txn.merchant_category,
+        location=txn.location,
+        event_ts=ts,
+        features=result["features"],
+        score=result["score"],
+        is_fraud=result["is_fraud"],
+        threshold=predictor.threshold,
+    ))
+
+
 @app.post("/predict", response_model=PredictResponse)
 def predict(txn: Transaction):
     ts = to_utc_epoch(txn.timestamp)
@@ -163,6 +189,7 @@ def predict(txn: Transaction):
         transaction_id=txn.transaction_id,
     )
     log_prediction(txn, result["features"], result["score"], result["is_fraud"])
+    publish_scored_event(txn, ts, result)
     if result["is_fraud"]:
         send_alert(txn.transaction_id, txn.card_id, txn.amount,
                     txn.merchant_category, txn.location, result["score"])

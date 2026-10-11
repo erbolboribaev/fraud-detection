@@ -1,3 +1,14 @@
+# Shared settings for the Spark lakehouse jobs. MinIO stands in for AWS S3
+# locally; the jobs only see an s3a:// path, so pointing them at real S3 means
+# changing LAKE_ROOT, removing S3_ENDPOINT and using an IAM role / real keys.
+x-lakehouse-env: &lakehouse-env
+  KAFKA_BOOTSTRAP: redpanda:9092
+  SCORED_TOPIC: scored-transactions
+  LAKE_ROOT: s3a://fraud-lake
+  S3_ENDPOINT: http://minio:9000
+  AWS_ACCESS_KEY_ID: minioadmin        # local demo credentials only
+  AWS_SECRET_ACCESS_KEY: minioadmin
+
 services:
   redpanda:
     image: redpandadata/redpanda:v24.2.7
@@ -33,6 +44,19 @@ services:
     ports:
       - "8080:8080"
 
+  # One-shot: create the topic the API publishes scored transactions to, so
+  # the Spark source never starts against a topic that doesn't exist yet.
+  kafka-init:
+    image: redpandadata/redpanda:v24.2.7
+    container_name: fraud-kafka-init
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - rpk topic create scored-transactions -X brokers=redpanda:9092 -p 1 -r 1 || true
+    restart: "no"
+
   redis:
     image: redis:7-alpine
     container_name: fraud-redis
@@ -53,10 +77,17 @@ services:
     depends_on:
       redis:
         condition: service_healthy
+      redpanda:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
     ports:
       - "8000:8000"
     environment:
       REDIS_HOST: redis
+      # Opt-in feed for the lakehouse: every scored transaction is also
+      # published to Kafka. Unset it and the API behaves exactly as before.
+      KAFKA_BOOTSTRAP: redpanda:9092
     volumes:
       - ./logs:/app/logs
     healthcheck:
@@ -97,3 +128,84 @@ services:
       - src.consumer
       - --bootstrap=redpanda:9092
       - --api-url=http://api:8000
+
+  # ------------------------------------------------------------------
+  # Lakehouse: Kafka -> bronze -> silver (Delta on S3-compatible storage)
+  # ------------------------------------------------------------------
+
+  minio:
+    image: minio/minio:RELEASE.2024-12-18T13-15-44Z
+    container_name: fraud-minio
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # web console: http://localhost:9001
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  # One-shot: create the bucket the lake lives in.
+  minio-init:
+    image: minio/mc:RELEASE.2024-11-21T17-21-54Z
+    container_name: fraud-minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - mc alias set local http://minio:9000 minioadmin minioadmin && mc mb --ignore-existing local/fraud-lake
+    restart: "no"
+
+  lakehouse-bronze:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.lakehouse
+    container_name: fraud-lakehouse-bronze
+    depends_on:
+      redpanda:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+      minio-init:
+        condition: service_completed_successfully
+    environment: *lakehouse-env
+    command: ["lakehouse.jobs.bronze"]
+    restart: unless-stopped
+
+  lakehouse-silver:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.lakehouse
+    container_name: fraud-lakehouse-silver
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
+      lakehouse-bronze:
+        condition: service_started
+    environment: *lakehouse-env
+    command: ["lakehouse.jobs.silver"]
+    restart: unless-stopped
+
+  # Batch job, not started by `docker compose up`. Run it on demand:
+  #   docker compose run --rm lakehouse-gold
+  lakehouse-gold:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.lakehouse
+    container_name: fraud-lakehouse-gold
+    profiles: ["batch"]
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
+    environment: *lakehouse-env
+    command: ["lakehouse.jobs.gold"]
+
+volumes:
+  minio-data:

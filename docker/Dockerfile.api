@@ -14,7 +14,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends libgomp1 \
 COPY requirements-api.txt .
 RUN pip install --no-cache-dir -r requirements-api.txt
 
-COPY src/schema.py src/predictor.py src/alerts.py src/__init__.py ./src/
+COPY src/schema.py src/predictor.py src/alerts.py src/events.py src/publisher.py src/__init__.py ./src/
 COPY api/ ./api/
 COPY models/ ./models/
 

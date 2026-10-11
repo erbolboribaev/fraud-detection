@@ -1,0 +1,29 @@
+# Lakehouse image: PySpark + Delta Lake jobs (bronze / silver / gold).
+# Which job runs is decided by the command each service passes in docker-compose.yml.
+#
+# Python 3.11 (not 3.12 like the other images): PySpark 3.5 is the version
+# line this project pins, and 3.11 is the safest interpreter for it.
+# Pinned to bookworm because the Java 17 package this relies on is not in newer Debian releases.
+FROM python:3.11-slim-bookworm
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        openjdk-17-jre-headless procps \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV PYTHONUNBUFFERED=1
+WORKDIR /app
+
+COPY requirements-lakehouse.txt .
+RUN pip install --no-cache-dir -r requirements-lakehouse.txt
+
+# lakehouse/ reads the event contract from src/events.py (stdlib-only module)
+COPY src/__init__.py src/schema.py src/events.py ./src/
+COPY lakehouse/ ./lakehouse/
+
+# Download the Delta / Kafka / S3A jars at build time so containers start fast
+# and don't need Maven Central at runtime. Fails the build loudly if the
+# package coordinates in lakehouse/config.py are wrong.
+RUN python -c "from lakehouse.config import LakeConfig, build_spark; \
+build_spark('warmup', LakeConfig(lake_root='file:///tmp/warmup')).stop()"
+
+ENTRYPOINT ["python", "-m"]
