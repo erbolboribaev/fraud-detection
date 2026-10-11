@@ -12,3 +12,4 @@ reports/
 
 # OS
 .DS_Store
+node_modules/
